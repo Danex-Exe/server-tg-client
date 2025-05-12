@@ -1,0 +1,8 @@
+# We only pass config.json
+data/*
+!data/config.json
+
+# We do not transfer the external module
+lib/DataBaze
+
+__pycache__/
