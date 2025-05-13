@@ -1,19 +1,43 @@
 import importlib.util
 import logging
 import threading
+import hashlib
 import asyncio
+import os
+import time
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
 
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup, constants
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
+)
+
+from fastapi import FastAPI, status, Header, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import httpx
+import uvicorn
+from dateutil.relativedelta import relativedelta
+
+# Инициализация базы данных и конфигурации
+from lib.DataBaze.DataBaze import DataBaze
+DATABAZE = DataBaze(path="data/")
+CONFIG_FILE = DATABAZE.file(name='config', type="json")
 
 # Настройка логов
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-
 formatter = logging.Formatter(
     "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-
 
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
@@ -21,83 +45,265 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 
-# Проверки исправности модулей
-def check_dependencies():
-    required = ['telegram', 'fastapi', 'lib.DataBaze.DataBaze']
-    for lib in required:
-        if not importlib.util.find_spec(lib.replace('.', '/')):
-            logger.error(f"Не установлен модуль: {lib}")
-            exit(1)
-
-
-from telegram import (
-    Update,
-    Bot,
-    constants, 
-    ReplyKeyboardMarkup, 
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup
-)
-from telegram.ext import (
-    Application, 
-    PicklePersistence,
-    ApplicationBuilder,
-    CommandHandler, 
-    CallbackQueryHandler,
-    MessageHandler, 
-    filters, 
-    ContextTypes
-)
-
-from lib.DataBaze.DataBaze import DataBaze
-from fastapi import FastAPI, status
-from pydantic import BaseModel
-import httpx
-import uvicorn
-
-
-DATABAZE = DataBaze(path="data/")
-CONFIG_FILE = DATABAZE.file(name='config', type="json")
+# Инициализация конфига
 DEFAULT_CONFIG = {
     "bot": {
         "token": "",
-        "bot_admins": []
+        "bot_admins": [],
+        "server_url": "http://localhost:8000",
+        "public_key": "server_public.pem",
+        "modules_path": "secure_modules"
     },
     "users": {}
 }
-app = FastAPI()
-
-
-class NotificationRequest(BaseModel):
-    message: str
-    data: dict = None
-
 
 CONFIG_FILE_CREATE_RESULT = CONFIG_FILE.create(DEFAULT_CONFIG)
-match CONFIG_FILE_CREATE_RESULT:
-    case 'file_exists':
-        if CONFIG_FILE.info()['size'] <= 2:
-            print(CONFIG_FILE.info()['size'])
-            logger.warning("Файл конфигурации бота пуст")
+if CONFIG_FILE_CREATE_RESULT == 'file_exists' and CONFIG_FILE.info()['size'] <= 2:
+    CONFIG_FILE.write(DEFAULT_CONFIG)
 
-            CONFIG_FILE.write(DEFAULT_CONFIG)
+config = CONFIG_FILE.read()
+TOKEN = config.get('bot', {}).get('token')
+BOT_ADMINS = config.get('bot', {}).get('bot_admins', [])
+SERVER_URL = config.get('bot', {}).get('server_url')
 
-            logger.info("В файл конфигурации бота была записана базовая конфигурация")
+app = FastAPI()
+application = Application.builder().token(TOKEN).build()
+
+# Модели данных
+class ModerationRequest(BaseModel):
+    user_id: str
+    client_hash: str
+    encrypted_data: bytes
+    signature: bytes
+
+class RegisterRequest(BaseModel):
+    system_id: str
+    user_key: str
+
+
+import time
+from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta
+
+class TimeUtils:
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def current_unix_timestamp() -> int:
+        """Возвращает текущий UNIX timestamp."""
+        return int(time.time())
+
+    @staticmethod
+    def timestamp_for_time(year: int, month: int, day: int, hour: int = 0, minute: int = 0, second: int = 0) -> int:
+        """Создает UNIX timestamp для заданного времени."""
+        dt = datetime(year, month, day, hour, minute, second)
+        return int(dt.timestamp())
+
+    @staticmethod
+    def future_timestamp(hours: int = 0, minutes: int = 0, seconds: int = 0) -> int:
+        """Возвращает UNIX timestamp для времени, которое наступит через указанное количество времени от сейчас."""
+        future_time = datetime.now() + timedelta(hours=hours, minutes=minutes, seconds=seconds)
+        return int(future_time.timestamp())
+
+    @staticmethod
+    def seconds_since(timestamp: int) -> int:
+        """Возвращает количество секунд, прошедших с указанного UNIX timestamp до сейчас."""
+        now_ts = int(time.time())
+        diff = now_ts - timestamp
+        return diff if diff >= 0 else 0
+
+    @staticmethod
+    def get_time_difference(past_timestamp: int) -> int:
+        """Возвращает разницу между текущим временем и указанным timestamp в секундах."""
+        now_ts = int(time.time())
+        diff = now_ts - past_timestamp
+        return diff
+
+    @staticmethod
+    def difference_between_timestamps(ts1: int, ts2: int) -> int:
+        """
+        Возвращает абсолютную разницу между двумя UNIX timestamp в секундах.
+        """
+        return abs(ts1 - ts2)
+
+utils = TimeUtils()
+
+wait_moderation = {
+
+}
+
+# ======================
+# Телеграм-обработчики
+# ======================
+
+async def handle_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global wait_moderation
+    query = update.callback_query
+    system_id, choice = query.data.split(':')
+
+    if system_id not in wait_moderation:
+        await query.answer("Запрос устарел")
+        return
     
-    case 'success':
-        logger.info("Файл конфигурации создан")
-        logger.info("В файл конфигурации записана базовая конфигурация")
+    user_key = wait_moderation[system_id]
 
-    case 'error':
-        logger.error("Произошла ошибка при создании конфигурационного файла")
+    try:
+        if choice == 'approve':
+            data = CONFIG_FILE.read()
 
-    case _:
-        logger.warning(f"Получен неизвестный ответ при создании конфигурационного файла: {CONFIG_FILE_CREATE_RESULT}")
+            data.setdefault('users', {})
+            data['users'][system_id] = {
+                'user_key': user_key
+            }
+            CONFIG_FILE.write(data)
+            await query.edit_message_text(f"✅ Решение {user_key} принято")
+            await query.answer("Решение принято")
+        else:
+            await query.edit_message_text(f"❌ Решение {user_key} не принято")
+            await query.answer("Решение не принято")
 
+    except Exception as e:
+        logger.error(f"Error handling moderation: {str(e)}")
+        await query.answer("Произошла ошибка")
 
-TOKEN = CONFIG_FILE.read().get('bot', {}).get('token')
-BOT_ADMINS = CONFIG_FILE.read().get('bot', {}).get('bot_admins', [])
+    finally:
+        del wait_moderation[system_id]
 
+async def send_moderation_request(system_id: str, user_key: str, admin_id: int):
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Разрешить", callback_data=f"{system_id}:approve"),
+        InlineKeyboardButton("❌ Запретить", callback_data=f"{system_id}:deny")
+    ]])
+
+    await application.bot.send_message(
+        chat_id=admin_id,
+        text=f"🚨 Новый запрос доступа\n\n"
+                f"Client Hash:\n`{system_id}`\n\n"
+                f"User Key:\n`{user_key}`",
+        reply_markup=keyboard,
+        parse_mode=constants.ParseMode.MARKDOWN_V2
+    )
+
+# ======================
+# FastAPI Endpoints
+# ======================
+
+# @app.post("/notify", status_code=status.HTTP_200_OK)
+# async def notify_admin(request: ModerationRequest, x_signature: str = Header(...)):
+#     try:
+#         # Проверка подписи
+#         pass
+
+#         # Отправка модераторам
+#         await send_moderation_request(request_id, pending_requests[request_id])
+
+#         return {"status": "success", "request_id": request_id}
+
+#     except Exception as e:
+#         logger.error(f"Notification error: {str(e)}")
+#         raise HTTPException(status_code=400, detail="Invalid request")
+    
+@app.post("/register")
+async def register(request: RegisterRequest):
+    data = CONFIG_FILE.read()
+
+    
+    data.setdefault('keys', {})
+    data.setdefault('users', {})
+    if request.user_key not in data.get('keys'):
+        return JSONResponse(
+            content={"error": "key_not_exist"},
+            status_code=404  # Not Found
+        )
+    
+    if request.system_id in data['users']:
+        if data['users'][request.system_id].get('user_key') == request.user_key:
+            return JSONResponse(
+                content={"status": "moderation_passed"},
+                status_code=200
+            )
+
+        if request.system_id in wait_moderation:
+            del wait_moderation[request.system_id]
+
+    if data['keys'][request.user_key].get('uses') == 0:
+        return JSONResponse(
+            content={"error": "max_use"},
+            status_code=403  # Forbidden
+        )
+    
+    if utils.get_time_difference(data['keys'][request.user_key].get('time_exists', 0)) > 0:
+        return JSONResponse(
+            content={"error": "time_exists"},
+            status_code=403  # Forbidden
+        )
+    
+    if request.system_id in wait_moderation:
+        return JSONResponse(
+            content={"error": "already_wait_moderation"},
+            status_code=403  # Forbidden
+        )
+    
+    if data['keys'][request.user_key].get('uses') != -1:
+        data['keys'][request.user_key]['uses'] -= 1
+        CONFIG_FILE.write(data)
+    
+    wait_moderation[request.system_id] = request.user_key
+    creator_id = data['keys'][request.user_key]['creator_id']
+
+    await send_moderation_request(request.system_id, request.user_key, creator_id)
+
+    return JSONResponse(
+        content={
+            "status": "success",
+        },
+        status_code=200  # OK
+    )
+    
+    # except Exception as e:
+    #     logger.error(f"Module error: {str(e)}")
+    #     raise HTTPException(status_code=500, detail="Internal server error")
+    
+@app.post("/get_module")
+async def get_module(request: RegisterRequest):
+    data = CONFIG_FILE.read()
+    try:
+        
+        data.setdefault('keys', {})
+        if request.user_key not in data.get('keys'):
+            return JSONResponse(
+                content={"error": "key_not_exist"},
+                status_code=404  # Not Found
+            )
+
+        data.setdefault('users', {})
+        if request.system_id not in data.get('users'):
+            return JSONResponse(
+                content={"error": "user_not_register"},
+                status_code=404  # Not Found
+            )
+        
+        if request.user_key != data['users'][request.system_id].get('user_key'):
+            return JSONResponse(
+                content={"error": "token_not_register"},
+                status_code=403  # Not Found
+            )
+        
+        code = ''
+        with open(CONFIG_FILE.read()['bot'].get('module'), "r", encoding='utf-8') as f:
+            code = f.read()
+        
+        return JSONResponse(
+            content={"status": code},
+            status_code=200  # Not Found
+        )
+    
+    except Exception as e:
+        logger.error(f"Module error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    
 
 # Command /start
 async def handle_command_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -130,49 +336,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         text
     )
 
-
-@app.post("/notify", status_code=status.HTTP_200_OK)
-async def notify_admin(request: NotificationRequest):
-    try:
-        message = f"Новое уведомление:\n{request.message}"
-
-
-        if request.data:
-            message += f"\nДанные: {request.data}"
-
-            
-        await Bot(token=TOKEN).send_message(chat_id=BOT_ADMINS[0], text=message)
-
-        
-        return {"status": "success", "message": "Notification sent"}
-    
-
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-
-# Error handler
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Error: {context.error}")
-    
-
-    if BOT_ADMINS != []:
-        try:
-            for chat_id in BOT_ADMINS:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⚠️ Ошибка в боте: {context.error}"
-                )
-
-
-                logger.error(f'Error message sent to administrator {chat_id}')
-
-
-        except Exception as e:
-            logger.error(f"[error_handler()] Error sending message: {str(e)}")
-
-
-# Launch notification
 async def launch_notify(application: Application) -> None:
     if BOT_ADMINS != []:
         try:
@@ -193,6 +356,31 @@ async def launch_notify(application: Application) -> None:
     client_handler = threading.Thread(target=run_main)
     client_handler.start()
 
+# Error handler
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Error: {context.error}")
+    
+
+    if BOT_ADMINS != []:
+        try:
+            for chat_id in BOT_ADMINS:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ Ошибка в боте: {context.error}"
+                )
+
+
+                logger.error(f'Error message sent to administrator {chat_id}')
+
+
+        except Exception as e:
+            logger.error(f"[error_handler()] Error sending message: {str(e)}")
+    
+# ======================
+# Запуск приложения
+# ======================
+
+
 
 try:
     application = Application.builder().token(TOKEN).post_init(launch_notify).build()
@@ -204,11 +392,10 @@ except Exception as e:
 
     exec(1)
 
-
-# Registering handlers
 handlers = [
     CommandHandler("start", handle_command_start),
-    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
+    CallbackQueryHandler(handle_moderation)
 ]
 
 
@@ -244,4 +431,6 @@ def run_main():
 
 
 if __name__ == "__main__":
+
+    # Регистрация обработчиков
     application.run_polling()

@@ -1,1 +1,5 @@
 python-telegram-bot
+fastapi[standart]
+cryptography
+uvicorn
+python-dateutil
